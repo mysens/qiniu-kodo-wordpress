@@ -21,6 +21,7 @@ define('KODO_BASEFOLDER', plugin_basename(dirname(__FILE__)));
 use Qiniu\Auth;
 use Qiniu\Storage\UploadManager;
 use Qiniu\Storage\BucketManager;
+use Qiniu\Processing\PersistentFop;
 
 if (!function_exists('get_home_path')) {
     require_once ABSPATH . 'wp-admin/includes/file.php';
@@ -40,6 +41,7 @@ function kodo_set_options()
         'upload_url_path' => '', // URL前缀
         'image_style' => '',
         'update_file_name' => 'false', // 是否重命名文件名
+        'watermark_default_txt' => '', //水印默认文本
     ];
     add_option('kodo_options', $options, '', 'yes');
 }
@@ -64,6 +66,18 @@ function kodo_get_bucket_name()
     $kodo_opt = get_option('kodo_options', true);
     return esc_attr($kodo_opt['bucket']);
 }
+
+//添加使用水印checkbox
+function add_pic_upload_watermark_checkbox_html()
+{
+    print('<div id="pic_watermark_html">
+        <br />
+        <!-- <input id="pic_watermark_checkbox" type="checkbox" name="pic_watermark" value="1" onclick="" />是否使用水印 -->
+        <input id="pic_watermark_checkbox" type="checkbox" name="pic_watermark" value="1" onclick="if(typeof(wpUploaderInit) != \'undefined\') {wpUploaderInit.multipart_params.pic_watermark = document.getElementById(\'pic_watermark_checkbox\').checked?1:0} else {wp.media.frame.uploader.uploader.param(\'pic_watermark\', document.getElementById(\'pic_watermark_checkbox\').checked?1:0)};" />是否使用水印
+        </div>');
+}
+
+add_action('post-plupload-upload-ui', 'add_pic_upload_watermark_checkbox_html');
 
 /**
  * @param string $object
@@ -91,13 +105,59 @@ function kodo_file_upload($object, $file, $no_local_file = false)
     // 初始化 UploadManager 对象并进行文件的上传。
     $uploadMgr = new UploadManager();
     // 调用 UploadManager 的 putFile 方法进行文件的上传。
-    $uploadMgr->putFile($token, $key, $filePath);
+    // $uploadMgr->putFile($token, $key, $filePath);
 //    list($ret, $err) = $uploadMgr->putFile($token, $key, $filePath);
 //    if ($err !== null) {
 //        var_dump($err);
 //    } else {
 //        var_dump($ret);
 //    }
+
+    $useWatermark = $_POST["pic_watermark"];
+
+    $kodo_options = get_option('kodo_options', true);
+    $watermark_txt = $kodo_options['watermark_default_txt'];
+
+    if ($useWatermark && !empty($watermark_txt)) {
+        // 使用水印
+        $origin_key = $key . "-origin";
+        $uploadMgr->putFile($token, $origin_key, $filePath);
+        // 初始化持久化
+        $bucket = kodo_get_bucket_name();
+        $pfop = new PersistentFop(kodo_get_auth());
+        $fops = "watermark/4/text/d3d3Lm15c2Vucy5jbHVi/fontsize/500/fill/Z3JheQ==/dissolve/15/rotate/30/uw/230/uh/160/resize/1|saveas/"
+            . \Qiniu\base64_urlSafeEncode("$bucket:$key");
+        list($id, $err) = $pfop->execute($bucket, $origin_key, $fops);
+        if ($err != null) {
+            // echo $fops;
+            // var_dump($err);
+            throw new \Exception("file water mark failed", 1);
+        }
+
+        // 查询转码的进度和状态
+        while (true) {
+            list($ret, $err) = $pfop->status($id);
+            if ($err != null) {
+                throw new \Exception("file water mark failed", 1);
+            } else if ($ret['code'] == 0) {
+                kodo_delete_file($origin_key);
+                break;
+            }
+            usleep(100000);
+        }
+
+    } else {
+        // 不使用水印
+        // 调用 UploadManager 的 putFile 方法进行文件的上传。
+        $uploadMgr->putFile($token, $key, $filePath);
+        //    list($ret, $err) = $uploadMgr->putFile($token, $key, $filePath);
+        //    if ($err !== null) {
+        //        var_dump($err);
+        //    } else {
+        //        var_dump($ret);
+        //    }
+    }
+
     if ($no_local_file) {
         kodo_delete_local_file($file);
     }
@@ -149,7 +209,7 @@ function kodo_delete_file($file)
     $bucket = kodo_get_bucket_name();
     $bucketManager = new BucketManager(kodo_get_auth());
     $err = $bucketManager->delete($bucket, $file);
-//    var_dump($err);
+    //    var_dump($err);
 }
 
 /**
@@ -167,7 +227,7 @@ function kodo_delete_files($bucket, array $files)
     $bucketManager = new BucketManager(kodo_get_auth());
     $ops = $bucketManager->buildBatchDelete($bucket, $deleteObjects);
     $bucketManager->batch($ops);
-//    list($ret, $err) = $bucketManager->batch($ops);
+    //    list($ret, $err) = $bucketManager->batch($ops);
 //    if ($err) {
 //        print_r($err);
 //    } else {
@@ -220,6 +280,15 @@ function kodo_upload_attachments($metadata)
 
     return $metadata;
 }
+
+function add_watermark_post_param($post_params)
+{
+    $post_params['pic_watermark'] = 0;
+    return $post_params;
+}
+
+add_filter('upload_post_params', 'add_watermark_post_param', 50);
+add_filter('plupload_default_params', 'add_watermark_post_param', 50);
 
 //避免上传插件/主题时出现同步到kodo的情况
 if (substr_count($_SERVER['REQUEST_URI'], '/update.php') <= 0) {
@@ -395,9 +464,9 @@ function kodo_sanitize_file_name($filename)
     $kodo_options = get_option('kodo_options');
     switch ($kodo_options['update_file_name']) {
         case 'md5':
-            return  md5($filename) . '.' . pathinfo($filename, PATHINFO_EXTENSION);
+            return md5($filename) . '.' . pathinfo($filename, PATHINFO_EXTENSION);
         case 'time':
-            return date('YmdHis', current_time('timestamp'))  . mt_rand(100, 999) . '.' . pathinfo($filename, PATHINFO_EXTENSION);
+            return date('YmdHis', current_time('timestamp')) . mt_rand(100, 999) . '.' . pathinfo($filename, PATHINFO_EXTENSION);
         default:
             return $filename;
     }
@@ -421,7 +490,8 @@ function kodo_read_dir_queue($homePath, $uploadPath)
         list($currentDir, $relativeDir) = $dirsToProcess->dequeue();
 
         foreach (new DirectoryIterator($currentDir) as $fileInfo) {
-            if ($fileInfo->isDot()) continue;
+            if ($fileInfo->isDot())
+                continue;
 
             $filepath = $fileInfo->getRealPath();
 
@@ -565,7 +635,7 @@ function kodo_setting_page()
         $postmeta_name = $wpdb->prefix . 'postmeta';
         $postmeta_result = $wpdb->query("UPDATE $postmeta_name SET meta_value = REPLACE( meta_value, '$old_url', '$new_url')");
 
-        echo '<div class="updated"><p><strong>替换成功！共替换文章内链'.$posts_result.'条、题图链接'.$postmeta_result.'条！</strong></p></div>';
+        echo '<div class="updated"><p><strong>替换成功！共替换文章内链' . $posts_result . '条、题图链接' . $postmeta_result . '条！</strong></p></div>';
     }
 
     // 若$options不为空数组，则更新数据
@@ -592,11 +662,15 @@ function kodo_setting_page()
     $kodo_update_file_name = esc_attr($kodo_options['update_file_name']);
 
     $protocol = (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off' || $_SERVER['SERVER_PORT'] == 443) ? 'https://' : 'http://';
-?>
+    ?>
     <div class="wrap" style="margin: 10px;">
-        <h1>七牛云 KODO <span style="font-size: 13px;">当前版本：<?php echo KODO_VERSION; ?></span></h1>
-        <p>如果觉得此插件对你有所帮助，不妨到 <a href="https://github.com/sy-records/qiniu-kodo-wordpress" target="_blank">GitHub</a> 上点个<code>Star</code>，<code>Watch</code>关注更新；<a href="https://go.qq52o.me/qm/ccs" target="_blank">欢迎加入云存储插件交流群，QQ群号：887595381</a>；</p>
-        <hr/>
+        <h1>七牛云 KODO <span style="font-size: 13px;">当前版本：
+                <?php echo KODO_VERSION; ?>
+            </span></h1>
+        <p>如果觉得此插件对你有所帮助，不妨到 <a href="https://github.com/sy-records/qiniu-kodo-wordpress" target="_blank">GitHub</a>
+            上点个<code>Star</code>，<code>Watch</code>关注更新；<a href="https://go.qq52o.me/qm/ccs"
+                target="_blank">欢迎加入云存储插件交流群，QQ群号：887595381</a>；</p>
+        <hr />
         <form method="post">
             <table class="form-table">
                 <tr>
@@ -604,22 +678,26 @@ function kodo_setting_page()
                         <legend>空间名称</legend>
                     </th>
                     <td>
-                        <input type="text" name="bucket" value="<?php echo esc_attr($kodo_options['bucket']); ?>" size="50" placeholder="请填写空间名称"/>
-                        <p>请先访问 <a href="https://portal.qiniu.com/kodo/bucket?shouldCreateBucket=true" target="_blank">七牛云控制台</a> 创建<code>存储空间</code>，再填写以上内容。</p>
+                        <input type="text" name="bucket" value="<?php echo esc_attr($kodo_options['bucket']); ?>" size="50"
+                            placeholder="请填写空间名称" />
+                        <p>请先访问 <a href="https://portal.qiniu.com/kodo/bucket?shouldCreateBucket=true"
+                                target="_blank">七牛云控制台</a> 创建<code>存储空间</code>，再填写以上内容。</p>
                     </td>
                 </tr>
                 <tr>
                     <th>
                         <legend>accessKey</legend>
                     </th>
-                    <td><input type="text" name="accessKey" value="<?php echo esc_attr($kodo_options['accessKey']); ?>" size="50" placeholder="accessKey"/></td>
+                    <td><input type="text" name="accessKey" value="<?php echo esc_attr($kodo_options['accessKey']); ?>"
+                            size="50" placeholder="accessKey" /></td>
                 </tr>
                 <tr>
                     <th>
                         <legend>secretKey</legend>
                     </th>
                     <td>
-                        <input type="password" name="secretKey" value="<?php echo esc_attr($kodo_options['secretKey']); ?>" size="50" placeholder="secretKey"/>
+                        <input type="password" name="secretKey" value="<?php echo esc_attr($kodo_options['secretKey']); ?>"
+                            size="50" placeholder="secretKey" />
                     </td>
                 </tr>
                 <tr>
@@ -641,23 +719,27 @@ function kodo_setting_page()
                     </td>
                 </tr>
                 <tr>
-                  <th>
-                    <legend>自动重命名文件</legend>
-                  </th>
-                  <td>
-                    <select name="update_file_name">
-                      <option <?php echo $kodo_update_file_name == 'false' ? 'selected="selected"' : ''; ?> value="false">不处理</option>
-                      <option <?php echo $kodo_update_file_name == 'md5' ? 'selected="selected"' : ''; ?> value="md5">MD5</option>
-                      <option <?php echo $kodo_update_file_name == 'time' ? 'selected="selected"' : ''; ?> value="time">时间戳+随机数</option>
-                    </select>
-                  </td>
+                    <th>
+                        <legend>自动重命名文件</legend>
+                    </th>
+                    <td>
+                        <select name="update_file_name">
+                            <option <?php echo $kodo_update_file_name == 'false' ? 'selected="selected"' : ''; ?>
+                                value="false">不处理</option>
+                            <option <?php echo $kodo_update_file_name == 'md5' ? 'selected="selected"' : ''; ?> value="md5">
+                                MD5</option>
+                            <option <?php echo $kodo_update_file_name == 'time' ? 'selected="selected"' : ''; ?> value="time">
+                                时间戳+随机数</option>
+                        </select>
+                    </td>
                 </tr>
                 <tr>
                     <th>
                         <legend>本地文件夹</legend>
                     </th>
                     <td>
-                        <input type="text" name="upload_path" value="<?php echo kodo_get_option('upload_path'); ?>" size="50" placeholder="请输入上传文件夹"/>
+                        <input type="text" name="upload_path" value="<?php echo kodo_get_option('upload_path'); ?>"
+                            size="50" placeholder="请输入上传文件夹" />
                         <p>附件在服务器上的存储位置，例如： <code>wp-content/uploads</code> （注意不要以“/”开头和结尾），根目录请输入<code>.</code>。</p>
                     </td>
                 </tr>
@@ -666,7 +748,8 @@ function kodo_setting_page()
                         <legend>URL前缀</legend>
                     </th>
                     <td>
-                        <input type="text" name="upload_url_path" value="<?php echo kodo_get_option('upload_url_path'); ?>" size="50" placeholder="请输入URL前缀"/>
+                        <input type="text" name="upload_url_path" value="<?php echo kodo_get_option('upload_url_path'); ?>"
+                            size="50" placeholder="请输入URL前缀" />
 
                         <p><b>注意：</b></p>
 
@@ -682,23 +765,35 @@ function kodo_setting_page()
                         <legend>图片样式</legend>
                     </th>
                     <td>
-                        <input type="text" name="image_style" value="<?php echo esc_attr($kodo_options['image_style']); ?>" size="50" placeholder="请输入图片样式，留空表示不处理"/>
+                        <input type="text" name="image_style" value="<?php echo esc_attr($kodo_options['image_style']); ?>"
+                            size="50" placeholder="请输入图片样式，留空表示不处理" />
 
                         <p><b>获取图片样式：</b></p>
 
-                        <p>1）在 <a href="https://portal.qiniu.com/kodo/bucket/image-style?bucketName=<?php echo esc_attr($kodo_options['bucket']); ?>" target="_blank">空间管理</a> 中对应空间的 <code>图片样式</code> 处添加。</p>
+                        <p>1）在 <a
+                                href="https://portal.qiniu.com/kodo/bucket/image-style?bucketName=<?php echo esc_attr($kodo_options['bucket']); ?>"
+                                target="_blank">空间管理</a> 中对应空间的 <code>图片样式</code> 处添加。</p>
 
                         <p>2）填写时需要将<code>分隔符</code>和对应的<code>名称</code>或 <code>处理接口</code>进行拼接，例如：</p>
 
-                        <p><code>分隔符</code>为<code>!</code>(感叹号)，<code>名称</code>为<code>webp</code>，<code>处理接口</code>为 <code>imageView2/0/format/webp/q/75</code></p>
+                        <p><code>分隔符</code>为<code>!</code>(感叹号)，<code>名称</code>为<code>webp</code>，<code>处理接口</code>为
+                            <code>imageView2/0/format/webp/q/75</code></p>
                         <p>则填写为 <code>!webp</code> 或 <code>?imageView2/0/format/webp/q/75</code></p>
+                    </td>
+                </tr>
+                <tr>
+                    <th>
+                        <legend>默认水印文字</legend>
+                    </th>
+                    <td>
+                        <input type="text" name="watermark_default_txt" value="<?php echo esc_attr($kodo_options['watermark_default_txt']); ?>" size="50" placeholder="请输入默认水印文字" />
                     </td>
                 </tr>
                 <tr>
                     <th>
                         <legend>保存/更新选项</legend>
                     </th>
-                    <td><input type="submit" class="button button-primary" value="保存更改"/></td>
+                    <td><input type="submit" class="button button-primary" value="保存更改" /></td>
                 </tr>
             </table>
             <input type="hidden" name="type" value="kodo_set">
@@ -711,8 +806,10 @@ function kodo_setting_page()
                     </th>
                     <input type="hidden" name="type" value="qiniu_kodo_all">
                     <td>
-                        <input type="submit" class="button button-secondary" value="开始同步"/>
-                        <p><b>注意：如果是首次同步，执行时间将会非常长（根据你的历史附件数量），有可能会因为执行时间过长，导致页面显示超时或者报错。<br> 所以，建议附件数量过多的用户，直接使用官方的 <a target="_blank" rel="nofollow" href="https://developer.qiniu.com/kodo/tools/6435/kodoimport">同步工具</a></b></p>
+                        <input type="submit" class="button button-secondary" value="开始同步" />
+                        <p><b>注意：如果是首次同步，执行时间将会非常长（根据你的历史附件数量），有可能会因为执行时间过长，导致页面显示超时或者报错。<br> 所以，建议附件数量过多的用户，直接使用官方的 <a
+                                    target="_blank" rel="nofollow"
+                                    href="https://developer.qiniu.com/kodo/tools/6435/kodoimport">同步工具</a></b></p>
                     </td>
                 </tr>
             </table>
@@ -725,7 +822,7 @@ function kodo_setting_page()
                         <legend>数据库原链接替换</legend>
                     </th>
                     <td>
-                        <input type="text" name="old_url" size="50" placeholder="请输入要替换的旧域名"/>
+                        <input type="text" name="old_url" size="50" placeholder="请输入要替换的旧域名" />
                     </td>
                 </tr>
                 <tr>
@@ -733,7 +830,7 @@ function kodo_setting_page()
                         <legend></legend>
                     </th>
                     <td>
-                        <input type="text" name="new_url" size="50" placeholder="请输入要替换的新域名"/>
+                        <input type="text" name="new_url" size="50" placeholder="请输入要替换的新域名" />
                     </td>
                 </tr>
                 <tr>
@@ -742,13 +839,13 @@ function kodo_setting_page()
                     </th>
                     <input type="hidden" name="type" value="qiniu_kodo_replace">
                     <td>
-                        <input type="submit" class="button button-secondary" value="开始替换"/>
+                        <input type="submit" class="button button-secondary" value="开始替换" />
                         <p><b>注意：如果是首次替换，请注意备份！此功能会替换文章以及设置的特色图片（题图）等使用的资源链接</b></p>
                     </td>
                 </tr>
             </table>
         </form>
     </div>
-<?php
+    <?php
 }
 ?>
